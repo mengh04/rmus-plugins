@@ -25,7 +25,7 @@ use store::{Episode, Store};
 use ui::style;
 
 declare_plugin_manifest! {
-    name: "rmus-podcast", version: "0.3.0", ui: true, tab: "播客",
+    name: "rmus-podcast", version: "0.3.1", ui: true, tab: "播客",
     methods: [
         ("fetch_feed", "task"),
         ("search_podcasts", "task"),
@@ -517,6 +517,8 @@ pub extern "C" fn update(ev: i32) -> i32 {
                         s.next_download_task += 1;
                         let ok = task::spawn(task_id, "download_episode", &spec);
                         if ok {
+                            // 同一集重试：清掉上次失败/残留的条目，避免旧状态压着新进度
+                            s.downloads.retain(|d| d.guid != guid);
                             s.downloads.push(Download {
                                 task_id,
                                 guid,
@@ -610,6 +612,7 @@ fn play_selected(s: &mut UiState) -> i32 {
     );
     if ok {
         s.pending_play = Some((guid.clone(), feed_url.clone()));
+        s.downloads.retain(|d| d.guid != guid);
         s.downloads.push(Download {
             task_id,
             guid,
@@ -737,18 +740,24 @@ fn on_data() -> i32 {
     let is_download = with_ui(|s| s.downloads.iter().any(|d| d.task_id == task_id));
     if is_download {
         return with_ui(|s| {
-            let Some(dl) = s.downloads.iter_mut().find(|d| d.task_id == task_id) else {
+            let Some(guid) = s
+                .downloads
+                .iter()
+                .find(|d| d.task_id == task_id)
+                .map(|d| d.guid.clone())
+            else {
                 return 0;
             };
-            let guid = dl.guid.clone();
             match event {
                 "progress" => {
-                    dl.received = inner
-                        .get("received")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(dl.received);
-                    if let Some(t) = inner.get("total").and_then(|v| v.as_u64()) {
-                        dl.total = Some(t);
+                    if let Some(dl) = s.downloads.iter_mut().find(|d| d.task_id == task_id) {
+                        dl.received = inner
+                            .get("received")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(dl.received);
+                        if let Some(t) = inner.get("total").and_then(|v| v.as_u64()) {
+                            dl.total = Some(t);
+                        }
                     }
                 }
                 "done" => {
@@ -763,6 +772,9 @@ fn on_data() -> i32 {
                         }
                         s.save();
                     }
+                    // 结束态必须摘掉在途条目：否则列表永远停在最后一条进度
+                    // （收到 100% 后 done 已到，行里却还画着进度条）
+                    s.downloads.retain(|d| d.task_id != task_id);
                     // 预约播放：下载完成自动开播
                     let auto = s.pending_play.take().filter(|(g, _)| g == &guid);
                     if let Some((_, feed_url)) = auto {
@@ -773,7 +785,9 @@ fn on_data() -> i32 {
                     }
                 }
                 "failed" => {
-                    dl.failed = Some(inner.as_str().unwrap_or("未知错误").to_string());
+                    if let Some(dl) = s.downloads.iter_mut().find(|d| d.task_id == task_id) {
+                        dl.failed = Some(inner.as_str().unwrap_or("未知错误").to_string());
+                    }
                 }
                 _ => {}
             }
