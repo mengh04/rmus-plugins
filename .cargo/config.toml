@@ -1,0 +1,9 @@
+# 插件产物一律是 wasm32 核心模块：把默认 target 定死，
+# `cargo build -r` 直接出 target/wasm32-unknown-unknown/release/*.wasm。
+[build]
+target = "wasm32-unknown-unknown"
+
+# 单测/example 要链接 native rlib，必须显式回到宿主机 target：
+#   cargo native
+[alias]
+native = "test --target x86_64-unknown-linux-gnu"

@@ -14,11 +14,18 @@ disappears with it.
 
 ```
 rustup target add wasm32-unknown-unknown
-cargo build --release --target wasm32-unknown-unknown
+cargo build -r
 ```
 
-Artifacts land in `target/wasm32-unknown-unknown/release/`: `rmus_dl.wasm`,
-`rmus_podcast.wasm`.
+`.cargo/config.toml` pins the default target to `wasm32-unknown-unknown`, so the
+`--target` flag is unnecessary. Artifacts land in
+`target/wasm32-unknown-unknown/release/`: `rmus_dl.wasm`, `rmus_podcast.wasm`.
+
+Unit tests link the native rlib, so they need the host target back:
+
+```
+cargo native    # cargo test --target x86_64-unknown-linux-gnu
+```
 
 ## Install
 
