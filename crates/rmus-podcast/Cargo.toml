@@ -1,0 +1,19 @@
+[package]
+name = "rmus-podcast"
+version = "0.2.0"
+edition = "2024"
+description = "rmus wasm 播客插件：RSS 订阅 / 单集浏览 / 下载与连播"
+license = "MIT"
+repository = "https://github.com/mengh04/rmus-plugins"
+
+[lib]
+# rlib 供 native 单测/example 链接；wasm 产物走 cdylib
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rmus-plugin-sdk = { git = "https://github.com/mengh04/rmus", branch = "main" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+# feed 解析（RSS 2.0 + iTunes namespace）；纯 Rust，事件流式读
+quick-xml = "0.37"

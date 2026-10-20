@@ -1,0 +1,9 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+# wasm 产物体积优先（插件被 rmusd 从磁盘加载，解释执行，代码量影响内存）
+[profile.release]
+opt-level = "s"
+lto = "thin"
+strip = "symbols"
