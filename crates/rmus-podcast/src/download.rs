@@ -1,6 +1,7 @@
 //! 单集下载（rmus-dl download.rs 的播客精简版）：http 流式 → 临时文件
-//! → 原子改名。文件名直接用 EP 标题（播客 mp3 常无 tag，不读 lofty）；
-//! 扩展名按魔数（flac / mp3）。
+//! → 原子改名。文件名直接用 EP 标题（播客常无 tag，不读 lofty）；
+//! 扩展名按魔数（flac / mp3 / ogg / m4a / wav）——播客源里 m4a(AAC) 很常见，
+//! 认错扩展名会让解码器按错误的容器解析。
 
 use std::path::{Path, PathBuf};
 
@@ -45,7 +46,7 @@ pub fn download_episode(
     let temp_str = temp.display().to_string();
     let mut file = fs::File::create(&temp_str)?;
 
-    let mut magic = [0u8; 4];
+    let mut magic = [0u8; 8];
     let mut received: u64 = 0;
     let mut chunk = [0u8; 64 * 1024];
     loop {
@@ -58,10 +59,10 @@ pub fn download_episode(
         if n == 0 {
             break;
         }
-        // 魔数在文件头：决定扩展名
-        let fill = (received as usize).min(4);
-        if fill < 4 {
-            let need = 4 - fill;
+        // 魔数在文件头：决定扩展名（m4a 的 "ftyp" 在第 4–8 字节，要多读 4 字节）
+        let fill = (received as usize).min(magic.len());
+        if fill < magic.len() {
+            let need = magic.len() - fill;
             magic[fill..fill + need.min(n)].copy_from_slice(&chunk[..need.min(n)]);
         }
         file.write_all(&chunk[..n])?;
@@ -71,9 +72,12 @@ pub fn download_episode(
     drop(file);
 
     let ext = match &magic {
-        b"fLaC" => "flac",
+        m if m[..4] == *b"fLaC" => "flac",
         m if m[..3] == *b"ID3" || (m[0] == 0xFF && m[1] & 0xE0 == 0xE0) => "mp3",
         m if m[..4] == *b"OggS" => "ogg",
+        // ISO BMFF（m4a/mp4）：播客里大量 AAC 单集都是这个容器
+        m if m[4..8] == *b"ftyp" => "m4a",
+        m if m[..4] == *b"RIFF" => "wav",
         _ => "mp3", // 默认按 mp3（播客绝对主流）
     };
     let final_name = format!("{stem}.{ext}");

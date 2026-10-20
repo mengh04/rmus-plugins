@@ -25,7 +25,7 @@ use store::{Episode, Store};
 use ui::style;
 
 declare_plugin_manifest! {
-    name: "rmus-podcast", version: "0.3.1", ui: true, tab: "播客",
+    name: "rmus-podcast", version: "0.3.2", ui: true, tab: "播客",
     methods: [
         ("fetch_feed", "task"),
         ("search_podcasts", "task"),
