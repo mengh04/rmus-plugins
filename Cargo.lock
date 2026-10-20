@@ -169,7 +169,7 @@ dependencies = [
 [[package]]
 name = "rmus-plugin-sdk"
 version = "0.1.0"
-source = "git+https://github.com/mengh04/rmus?branch=main#5be700ddffcda7857c7ebebef0109972eb5106c0"
+source = "git+https://github.com/mengh04/rmus?branch=main#4047cab138283a7a8c41b7ade211a4eeb7d327d6"
 dependencies = [
  "anyhow",
  "lofty",
@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "rmus-podcast"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "quick-xml",

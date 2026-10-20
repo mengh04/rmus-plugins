@@ -1,18 +1,19 @@
 //! rmus-podcast：播客订阅插件（wasm，TUI「播客」tab 画布）。
 //!
 //! 架构分工（方案 docs/podcast-plugin-plan.md，宿主只当解码播放器）：
-//! - 订阅/退订/单集浏览/状态全部插件自治（data_dir 下 JSON 存档）
-//! - feed 抓取解析在 worker（task::spawn → fetch_feed → quick-xml），
+//! - 搜索/订阅/退订/单集浏览/状态全部插件自治（data_dir 下 JSON 存档）
+//! - 搜索（iTunes 目录）与 feed 抓取解析都在 worker（task::spawn），
 //!   done/failed 经 KIND_DATA 回注重绘，UI 线程零阻塞
-//! - 下载与连播接管在后续版本（v1 纯浏览；d/p/x 中 d 预留）
+//! - 下载与连播接管在 worker 里（纯 status 采样，不依赖推送）
 //!
-//! 画布两级：订阅列表（a 订阅 / x 退订 / Enter 进单集）→ 单集列表
-//! （p 标已播 / h 返回）。字符输入无退格通道（TUI 只转发 Char，
-//! Backspace 事件丢失）——输错 URL 用 h/Esc 重来（TODO v2 加
-//! KIND_BACKSPACE 事件编码）。
+//! 画布三级：搜索（s 输关键词 → Enter）→ 订阅列表（a 贴 feed URL /
+//! x 退订 / Enter 进单集）→ 单集列表（d 下载 / Enter 播放 / p 标已播 /
+//! h 返回）。输入态支持 `KIND_BACKSPACE` 删字符，退成空串即取消；
+//! 搜索命中与手贴 RSS 走同一条 fetch_feed 订阅链路。
 
 mod download;
 pub mod feed;
+pub mod search;
 pub mod store;
 
 use std::path::{Path, PathBuf};
@@ -24,14 +25,21 @@ use store::{Episode, Store};
 use ui::style;
 
 declare_plugin_manifest! {
-    name: "rmus-podcast", version: "0.2.0", ui: true, tab: "播客",
-    methods: [("fetch_feed", "task"), ("download_episode", "task"), ("podcast_worker", "task")],
+    name: "rmus-podcast", version: "0.3.0", ui: true, tab: "播客",
+    methods: [
+        ("fetch_feed", "task"),
+        ("search_podcasts", "task"),
+        ("download_episode", "task"),
+        ("podcast_worker", "task")
+    ],
     handle: handle,
 }
 
-/// 任务号分区：feed 刷新 100+，下载 1000+（回执按号段分发），worker 固定 7。
+/// 任务号分区：feed 刷新 100+，搜索 50000+，下载 1000+（回执按 id 查表
+/// 分发，号段只用来保证一次会话内不撞号）。
 const FETCH_TASK_BASE: u64 = 100;
 const DOWNLOAD_TASK_BASE: u64 = 1000;
+const SEARCH_TASK_BASE: u64 = 50_000;
 const WORKER_TASK: u64 = 7;
 
 /// 下载中的行（内存态；完成后落到 Episode.downloaded）。
@@ -47,6 +55,20 @@ struct Download {
 enum View {
     Subs,
     Eps,
+    Search,
+}
+
+/// 输入态用途：贴 feed 地址 / 输搜索关键词。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum InputKind {
+    FeedUrl,
+    Query,
+}
+
+/// 画布输入态（a / s 开启；Enter 提交，退格删字符，空串退格取消）。
+struct Input {
+    kind: InputKind,
+    text: String,
 }
 
 struct UiState {
@@ -58,8 +80,16 @@ struct UiState {
     /// 两级视图各自的窗口滚动（切换后各自保留）
     subs_scroll: usize,
     eps_scroll: usize,
-    /// a 键的 feed URL 输入态（None = 非输入态）
-    input: Option<String>,
+    /// a 键的 feed URL 输入态 / s 键的搜索词输入态（None = 非输入态）
+    input: Option<Input>,
+    /// 搜索结果（View::Search 的内容）
+    hits: Vec<search::Hit>,
+    hit_sel: usize,
+    hit_scroll: usize,
+    /// 在途搜索任务号（None = 没有正在跑的搜索）
+    search_task: Option<u64>,
+    /// 结果页标题里的关键词
+    query: String,
     /// 底部状态行（订阅中/退订提示/错误信息），一次性消费
     status: Option<String>,
     /// 在途 feed 刷新：feed_url -> task_id（去重 + 回执分发）
@@ -69,8 +99,10 @@ struct UiState {
     /// 下载完成后自动播放的集（Enter 未下载时的预约）
     pending_play: Option<(String, String)>,
     next_task: u64,
-    /// 下载任务号独立计数（1000+；回执按 >= 1000 分流）
+    /// 下载任务号独立计数（1000+；按 id 查表分发）
     next_download_task: u64,
+    /// 搜索任务号独立计数（50000+）
+    next_search_task: u64,
     /// 常驻 worker（进度采样 + 连播）只起一次
     worker_spawned: bool,
 }
@@ -100,12 +132,18 @@ impl UiState {
             subs_scroll: 0,
             eps_scroll: 0,
             input: None,
+            hits: Vec::new(),
+            hit_sel: 0,
+            hit_scroll: 0,
+            search_task: None,
+            query: String::new(),
             status: None,
             fetching: Vec::new(),
             downloads: Vec::new(),
             pending_play: None,
             next_task: FETCH_TASK_BASE,
             next_download_task: DOWNLOAD_TASK_BASE,
+            next_search_task: SEARCH_TASK_BASE,
             worker_spawned: false,
         }
     }
@@ -135,6 +173,25 @@ impl UiState {
             false
         }
     }
+
+    /// 发起 iTunes 搜索；结果经 KIND_DATA 回注（号段 50000+）。
+    fn spawn_search(&mut self, query: &str) -> bool {
+        let task_id = self.next_search_task;
+        self.next_search_task += 1;
+        let spec = serde_json::json!({ "query": query });
+        if task::spawn(task_id, "search_podcasts", &spec) {
+            self.search_task = Some(task_id);
+            self.hits.clear();
+            self.hit_sel = 0;
+            self.hit_scroll = 0;
+            self.query = query.to_string();
+            self.view = View::Search;
+            true
+        } else {
+            self.status = Some("宿主拒绝搜索任务".into());
+            false
+        }
+    }
 }
 
 static UI: Mutex<Option<UiState>> = Mutex::new(None);
@@ -148,6 +205,19 @@ fn with_ui<R>(f: impl FnOnce(&mut UiState) -> R) -> R {
 fn handle(method: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
     match method {
         "fetch_feed" => fetch_feed(params).map_err(|e| format!("{e:#}")),
+        // 目录搜索（iTunes Search API）：只回候选，订阅仍走 fetch_feed
+        "search_podcasts" => {
+            let query = params
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if query.is_empty() {
+                return Err("缺少搜索关键词".into());
+            }
+            let hits = search::search(query).map_err(|e| format!("{e:#}"))?;
+            Ok(serde_json::json!({ "hits": hits }))
+        }
         "download_episode" => download::download_episode(
             params.get("url").and_then(|v| v.as_str()).unwrap_or(""),
             params.get("title").and_then(|v| v.as_str()).unwrap_or("episode"),
@@ -204,7 +274,9 @@ fn fetch_feed(params: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn update(ev: i32) -> i32 {
-    use rmus_plugin_sdk::event::{char_of, encode, kind, KIND_CHAR, KIND_DATA, KIND_DOWN, KIND_ENTER, KIND_UP};
+    use rmus_plugin_sdk::event::{
+        char_of, encode, kind, KIND_BACKSPACE, KIND_CHAR, KIND_DATA, KIND_DOWN, KIND_ENTER, KIND_UP,
+    };
 
     match kind(ev) {
         KIND_DATA => on_data(),
@@ -212,6 +284,7 @@ pub extern "C" fn update(ev: i32) -> i32 {
             with_ui(|s| match s.view {
                 View::Subs => s.subs_sel = s.subs_sel.saturating_sub(1),
                 View::Eps => s.eps_sel = s.eps_sel.saturating_sub(1),
+                View::Search => s.hit_sel = s.hit_sel.saturating_sub(1),
             });
             1
         }
@@ -228,39 +301,65 @@ pub extern "C" fn update(ev: i32) -> i32 {
                         s.eps_sel += 1;
                     }
                 }
+                View::Search => {
+                    if s.hit_sel + 1 < s.hits.len() {
+                        s.hit_sel += 1;
+                    }
+                }
             });
             1
         }
+        KIND_BACKSPACE => with_ui(|s| {
+            let Some(input) = s.input.as_mut() else {
+                return 0;
+            };
+            // 退成空串再按一次退格 = 取消输入（Esc 在直通模式下归宿主）
+            if input.text.pop().is_none() {
+                s.input = None;
+                s.status = Some("已取消输入".into());
+            }
+            1
+        }),
         KIND_ENTER => {
             self::ensure_worker();
 
-            // 输入态：提交订阅
-            let submitted = with_ui(|s| match s.input.take() {
-                Some(url) => {
-                    if !url.starts_with("http://") && !url.starts_with("https://") {
-                        s.status = Some("feed 地址要以 http(s):// 开头".into());
-                        s.input = Some(url);
-                        None
-                    } else if s.store.podcasts.iter().any(|p| p.feed_url == url) {
-                        s.status = Some("这个播客已在订阅里".into());
-                        None
-                    } else {
-                        Some(url)
-                    }
+            // 输入态：按用途提交（贴 feed / 搜关键词）
+            let submitted = with_ui(|s| s.input.take());
+            if let Some(input) = submitted {
+                let text = input.text.trim().to_string();
+                if text.is_empty() {
+                    with_ui(|s| s.status = Some("已取消输入".into()));
+                    return 1;
                 }
-                None => None,
-            });
-            if let Some(url) = submitted {
-                return with_ui(|s| {
-                    if s.spawn_fetch(&url) {
-                        s.status = Some(format!("订阅中：{url}"));
+                return with_ui(|s| match input.kind {
+                    InputKind::FeedUrl => {
+                        if !text.starts_with("http://") && !text.starts_with("https://") {
+                            s.status = Some("feed 地址要以 http(s):// 开头".into());
+                            s.input = Some(Input {
+                                kind: InputKind::FeedUrl,
+                                text,
+                            });
+                            return 1;
+                        }
+                        if s.store.podcasts.iter().any(|p| p.feed_url == text) {
+                            s.status = Some("这个播客已在订阅里".into());
+                            return 1;
+                        }
+                        if s.spawn_fetch(&text) {
+                            s.status = Some(format!("订阅中：{text}"));
+                        }
+                        1
                     }
-                    1
+                    InputKind::Query => {
+                        s.spawn_search(&text);
+                        1
+                    }
                 });
             }
-            // 非输入态：订阅列表进单集（顺带异步刷新）；单集列表播放
-            return with_ui(|s| {
-                if s.view == View::Subs {
+            // 非输入态：订阅列表进单集（顺带异步刷新）；搜索结果订阅；
+            // 单集列表播放
+            with_ui(|s| match s.view {
+                View::Subs => {
                     let feed_url = s
                         .store
                         .podcasts
@@ -272,19 +371,20 @@ pub extern "C" fn update(ev: i32) -> i32 {
                         s.spawn_fetch(&feed_url);
                         return 1;
                     }
-                    return 0;
+                    0
                 }
-                play_selected(s)
-            });
+                View::Search => subscribe_selected(s),
+                View::Eps => play_selected(s),
+            })
         }
         KIND_CHAR => {
             let ch = char_of(ev).unwrap_or('\0');
-            // 输入态：收字符（无退格通道，见模块注释）
+            // 输入态：收字符（中文关键词也要能输入，不用 ascii_graphic 过滤）
             if with_ui(|s| s.input.is_some()) {
-                if ch.is_ascii_graphic() {
+                if !ch.is_control() {
                     with_ui(|s| {
                         if let Some(input) = s.input.as_mut() {
-                            input.push(ch);
+                            input.text.push(ch);
                         }
                     });
                     return 1;
@@ -294,16 +394,33 @@ pub extern "C" fn update(ev: i32) -> i32 {
             match ch {
                 'j' => return update(encode(KIND_DOWN, 0)),
                 'k' => return update(encode(KIND_UP, 0)),
+                's' | '/' => {
+                    with_ui(|s| {
+                        s.input = Some(Input {
+                            kind: InputKind::Query,
+                            text: String::new(),
+                        });
+                        s.ensure_worker();
+                    });
+                    1
+                }
                 'a' => {
                     with_ui(|s| {
-                        s.input = Some(String::new());
+                        s.input = Some(Input {
+                            kind: InputKind::FeedUrl,
+                            text: String::new(),
+                        });
                         s.ensure_worker();
                     });
                     1
                 }
                 'h' => {
                     with_ui(|s| {
-                        if s.view == View::Eps {
+                        if s.view != View::Subs {
+                            // 离开搜索页：在途搜索取消，结果迟到也不改状态
+                            if let Some(id) = s.search_task.take() {
+                                let _ = task::cancel(id);
+                            }
                             s.view = View::Subs;
                         }
                     });
@@ -452,6 +569,21 @@ fn play_selected(s: &mut UiState) -> i32 {
     1
 }
 
+/// 搜索结果页 Enter：订阅选中命中（走 fetch_feed，与手贴 RSS 同一条链路）。
+fn subscribe_selected(s: &mut UiState) -> i32 {
+    let Some(hit) = s.hits.get(s.hit_sel).cloned() else {
+        return 0;
+    };
+    if s.store.podcasts.iter().any(|p| p.feed_url == hit.feed_url) {
+        s.status = Some(format!("已在订阅里：{}", hit.title));
+        return 1;
+    }
+    if s.spawn_fetch(&hit.feed_url) {
+        s.status = Some(format!("订阅中：{}", hit.title));
+    }
+    1
+}
+
 /// 单集的绝对落盘路径（已下载）。
 impl UiState {
     fn play_path_of(&self, feed_url: &str, guid: &str) -> Option<String> {
@@ -516,8 +648,39 @@ fn on_data() -> i32 {
         return 1; // advance 等其他 worker 通知：重绘即可
     }
 
-    // 下载任务回执（task_id >= 1000）
-    if task_id >= 1000 {
+    // 搜索回执（命中在途搜索任务号）
+    let is_search = with_ui(|s| s.search_task == Some(task_id));
+    if is_search {
+        return with_ui(|s| {
+            match event {
+                "done" => {
+                    let hits: Vec<search::Hit> = inner
+                        .get("hits")
+                        .cloned()
+                        .and_then(|v| serde_json::from_value(v).ok())
+                        .unwrap_or_default();
+                    let n = hits.len();
+                    s.search_task = None;
+                    s.hits = hits;
+                    s.hit_sel = 0;
+                    s.hit_scroll = 0;
+                    s.status = (n == 0).then(|| "没有找到播客".to_string());
+                }
+                "failed" => {
+                    let err = inner.as_str().unwrap_or("未知错误").to_string();
+                    s.search_task = None;
+                    s.status = Some(format!("搜索失败：{err}"));
+                }
+                // 搜索任务不发 progress；其它事件忽略
+                _ => return 0,
+            }
+            1
+        });
+    }
+
+    // 下载任务回执（按任务号查在途表）
+    let is_download = with_ui(|s| s.downloads.iter().any(|d| d.task_id == task_id));
+    if is_download {
         return with_ui(|s| {
             let Some(dl) = s.downloads.iter_mut().find(|d| d.task_id == task_id) else {
                 return 0;
@@ -584,9 +747,22 @@ fn on_data() -> i32 {
                 .unwrap_or_default();
             with_ui(|s| {
                 s.fetching.retain(|(_, id)| *id != task_id);
+                // 新订阅：直接开到这个播客的单集页（已有的刷新则原地不动）
+                let is_new = !s.store.podcasts.iter().any(|p| p.feed_url == feed_url);
                 s.store.merge_episodes(&feed_url, title, author, episodes);
                 s.save();
-                s.status = Some("订阅完成".into());
+                s.status = Some(if is_new {
+                    "订阅完成".into()
+                } else {
+                    "刷新完成".into()
+                });
+                if is_new
+                    && let Some(idx) = s.store.podcasts.iter().position(|p| p.feed_url == feed_url)
+                {
+                    s.view = View::Eps;
+                    s.subs_sel = idx;
+                    s.eps_sel = 0;
+                }
             });
             1
         }
@@ -615,17 +791,21 @@ pub extern "C" fn render(rows: i32, cols: i32) {
     let width = cols.max(20) as usize;
     let mut state = UI.lock().unwrap();
     let Some(s) = state.as_mut() else {
-        ui::print_line(&[ui::span(style::STRONG, "按 a 订阅播客 feed")]);
+        ui::print_line(&[ui::span(style::STRONG, "按 i 进入直通后：a 贴 RSS · s 搜索")]);
         return;
     };
 
     // 头行：标题/输入态/状态消息
     match (&s.view, &s.input) {
         (_, Some(input)) => {
+            let (label, action) = match input.kind {
+                InputKind::FeedUrl => ("订阅 feed：", "Enter 订阅"),
+                InputKind::Query => ("搜索播客：", "Enter 搜索"),
+            };
             ui::print_line(&[
-                ui::span(style::FAINT, "订阅 feed："),
-                ui::span(style::ACCENT, input.clone()),
-                ui::span(style::FAINT, "_  (Enter 提交 · h 取消)"),
+                ui::span(style::FAINT, label),
+                ui::span(style::ACCENT, input.text.clone()),
+                ui::span(style::FAINT, format!("_  （{action} · 退格删字 · 空行取消）")),
             ]);
         }
         (View::Subs, _) => {
@@ -637,6 +817,10 @@ pub extern "C" fn render(rows: i32, cols: i32) {
             if let Some(msg) = s.status.take() {
                 spans.push(ui::span(style::ACCENT, format!("  ·  {msg}")));
             }
+            spans.push(ui::span(
+                style::FAINT,
+                "  ·  s 搜索 · a 贴 RSS · Enter 单集 · x 退订",
+            ));
             ui::print_line(&spans);
         }
         (View::Eps, _) => {
@@ -659,6 +843,25 @@ pub extern "C" fn render(rows: i32, cols: i32) {
             if let Some(msg) = s.status.take() {
                 spans.push(ui::span(style::ACCENT, format!("  ·  {msg}")));
             }
+            spans.push(ui::span(
+                style::FAINT,
+                "  ·  d 下载 · Enter 播放 · p 已播 · h 返回",
+            ));
+            ui::print_line(&spans);
+        }
+        (View::Search, _) => {
+            let n = s.hits.len();
+            let mut spans = vec![
+                ui::span(style::STRONG, format!("搜索“{}”", s.query)),
+                ui::span(style::FAINT, format!("  ·  {n} 个结果")),
+            ];
+            if s.search_task.is_some() {
+                spans.push(ui::span(style::ACCENT, "  ·  搜索中…"));
+            }
+            if let Some(msg) = s.status.take() {
+                spans.push(ui::span(style::ACCENT, format!("  ·  {msg}")));
+            }
+            spans.push(ui::span(style::FAINT, "  ·  Enter 订阅 · h 返回"));
             ui::print_line(&spans);
         }
     }
@@ -671,6 +874,7 @@ pub extern "C" fn render(rows: i32, cols: i32) {
     match s.view {
         View::Subs => render_subs(s, width, rows),
         View::Eps => render_eps(s, width, rows),
+        View::Search => render_search(s, width, rows),
     }
 }
 
@@ -678,9 +882,13 @@ pub extern "C" fn render(rows: i32, cols: i32) {
 fn render_subs(s: &mut UiState, width: usize, rows: i32) {
     if s.store.podcasts.is_empty() {
         ui::print_line(&[
-            ui::span(style::FAINT, "还没有订阅。"),
-            ui::span(style::BASE, "按 a 贴一个 RSS feed 地址"),
-            ui::span(style::FAINT, "（iTunes/泛用型客户端里都能复制到）"),
+            ui::span(style::FAINT, "还没有订阅。按 "),
+            ui::span(style::ACCENT, "i"),
+            ui::span(style::FAINT, " 进入按键直通后："),
+            ui::span(style::ACCENT, "s"),
+            ui::span(style::BASE, " 搜索播客，或 "),
+            ui::span(style::ACCENT, "a"),
+            ui::span(style::BASE, " 贴一个 RSS feed 地址"),
         ]);
         return;
     }
@@ -717,6 +925,66 @@ fn render_subs(s: &mut UiState, width: usize, rows: i32) {
             ui::span(
                 if unplayed > 0 { style::ACCENT } else { style::FAINT },
                 format!("  {}", ui::pad_left(&unplayed.to_string(), count_w)),
+            ),
+        ]);
+    }
+}
+
+/// 搜索结果：标题<flex> 作者<16> 集数<5>（已订阅的打 ✓）。
+fn render_search(s: &mut UiState, width: usize, rows: i32) {
+    let author_w = (width / 4).clamp(8, 20);
+    let count_w = 5;
+    let title_w = width.saturating_sub(author_w + count_w + 8).max(10);
+
+    ui::print_line(&[
+        ui::span(style::FAINT, ui::pad_right("标题", title_w)),
+        ui::span(style::FAINT, format!("  {}", ui::pad_right("作者", author_w))),
+        ui::span(style::FAINT, format!("  {}", ui::pad_left("单集", count_w))),
+    ]);
+    ui::print_line(&[ui::span(style::RULE, "─".repeat(width))]);
+
+    if s.hits.is_empty() {
+        if s.search_task.is_some() {
+            ui::print_line(&[ui::span(style::FAINT, "搜索中…")]);
+        } else {
+            ui::print_line(&[
+                ui::span(style::FAINT, "没有匹配的播客。"),
+                ui::span(style::BASE, "按 h 返回后换个关键词"),
+                ui::span(style::FAINT, "（或 a 直接贴 RSS）"),
+            ]);
+        }
+        return;
+    }
+
+    let list_h = (rows.max(4) as usize).saturating_sub(3);
+    let total = s.hits.len();
+    let first = ui::window(&mut s.hit_scroll, s.hit_sel, total, list_h);
+    ui::set_selected(3 + s.hit_sel - first);
+
+    let hits = s.hits.clone();
+    for (i, hit) in hits[first..].iter().take(list_h).enumerate() {
+        let i = first + i;
+        let selected = i == s.hit_sel;
+        let title_style = if selected { style::STRONG } else { style::BASE };
+        let subscribed = s
+            .store
+            .podcasts
+            .iter()
+            .any(|p| p.feed_url == hit.feed_url);
+        ui::print_line(&[
+            ui::span(style::FAINT, ui::pad_left(&(i + 1).to_string(), 3)),
+            ui::span(
+                title_style,
+                format!("  {}", ui::pad_right(&hit.title, title_w.saturating_sub(3))),
+            ),
+            ui::span(style::BASE, format!("  {}", ui::pad_right(&hit.author, author_w))),
+            ui::span(
+                style::FAINT,
+                format!("  {}", ui::pad_left(&hit.episodes.to_string(), count_w)),
+            ),
+            ui::span(
+                if subscribed { style::OK } else { style::FAINT },
+                if subscribed { "  ✓" } else { "" },
             ),
         ]);
     }

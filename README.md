@@ -8,7 +8,7 @@ disappears with it.
 | crate | tab | what it does |
 | --- | --- | --- |
 | [`rmus-dl`](crates/rmus-dl) | `在线` | search and download from kuwo / kugou, tags and cover art written on the way in |
-| [`rmus-podcast`](crates/rmus-podcast) | `播客` | RSS / iTunes subscriptions, episode browsing, download and continuous playback |
+| [`rmus-podcast`](crates/rmus-podcast) | `播客` | search (iTunes directory) and RSS subscriptions, episode browsing, download and continuous playback |
 
 ## Build
 
