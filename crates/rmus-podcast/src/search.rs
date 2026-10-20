@@ -4,8 +4,12 @@
 //! 链路，所以搜索不引入新数据模型——结果页只是一行候选，订阅后与手贴
 //! RSS 走同一条路。
 //!
-//! 目录按国家分库（AntennaPod 也有国家设置）；这里先固定 `cn`，中文播客
-//! 命中率优先。TODO 后续经宿主配置读地区 / 无结果时回退 US。
+//! 两个实测取舍（2026-10-20）：
+//! - **目录按国家分库**：`country=cn` 中文播客排序好，但英文播客几乎搜不到
+//!   （实测 "lex fridman" 只回 1 条），所以 cn + us 各查一次，按 `feedUrl`
+//!   去重合并，cn 的排序优先
+//! - **Search API 不支持 offset**（带 offset 返回与第一页相同），所以一次
+//!   拉满 100 条/国家，翻页交给插件本地切页（每页 25 条）
 
 use anyhow::{Context, anyhow};
 use rmus_plugin_sdk::http;
@@ -23,19 +27,47 @@ pub struct Hit {
 }
 
 const SEARCH_API: &str = "https://itunes.apple.com/search";
-/// 一次拉多少条（iTunes 上限 200；25 条足够一屏浏览）
-const LIMIT: usize = 25;
+/// 每次查询的国家（顺序即合并后的排序优先级）
+const COUNTRIES: [&str; 2] = ["cn", "us"];
+/// 单国拉取条数（iTunes 上限 200；100 条 × 2 国足够本地翻几页）
+const LIMIT: usize = 100;
 
 /// 关键词搜索播客（网络 + 解析，必须在 worker 里跑）。
+///
+/// 单国失败不拖垮整次搜索：另一国命中照用；都失败才报错。
 pub fn search(query: &str) -> anyhow::Result<Vec<Hit>> {
+    let mut merged: Vec<Hit> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for country in COUNTRIES {
+        match search_country(query, country) {
+            Ok(hits) => merge_unique(&mut merged, hits),
+            Err(e) => errors.push(format!("{country}: {e:#}")),
+        }
+    }
+    if merged.is_empty() && !errors.is_empty() {
+        anyhow::bail!("{}", errors.join("；"));
+    }
+    Ok(merged)
+}
+
+fn search_country(query: &str, country: &str) -> anyhow::Result<Vec<Hit>> {
     let url = format!(
-        "{SEARCH_API}?media=podcast&entity=podcast&limit={LIMIT}&country=cn&term={}",
+        "{SEARCH_API}?media=podcast&entity=podcast&limit={LIMIT}&country={country}&term={}",
         encode(query)
     );
     let body = http::Response::send(&http::Request::get(url))?
         .error_for_status()?
         .read_to_end()?;
     parse(&body)
+}
+
+/// 按 `feed_url` 去重追加（cn 结果先入，us 只补 cn 没有的）。
+fn merge_unique(into: &mut Vec<Hit>, hits: Vec<Hit>) {
+    for hit in hits {
+        if !into.iter().any(|h| h.feed_url == hit.feed_url) {
+            into.push(hit);
+        }
+    }
 }
 
 /// 解析 iTunes 响应。非播客/已下架条目没有 `feedUrl`，直接跳过。
@@ -90,6 +122,15 @@ pub fn encode(s: &str) -> String {
 mod tests {
     use super::*;
 
+    fn hit(title: &str, feed: &str) -> Hit {
+        Hit {
+            title: title.into(),
+            author: String::new(),
+            feed_url: feed.into(),
+            episodes: 0,
+        }
+    }
+
     #[test]
     fn 中文关键词按_utf8_百分号编码() {
         // 硬核电台：4 个字 × 3 字节
@@ -118,7 +159,24 @@ mod tests {
 
     #[test]
     fn 空结果与坏_json() {
-        assert!(parse(br#"{"resultCount":0,"results":[]}"#).unwrap().is_empty());
+        assert!(
+            parse(br#"{"resultCount":0,"results":[]}"#)
+                .unwrap()
+                .is_empty()
+        );
         assert!(parse(b"not json").is_err());
+    }
+
+    #[test]
+    fn 合并按_feedurl_去重且保留先到顺序() {
+        let mut merged = vec![hit("甲", "https://a"), hit("乙", "https://b")];
+        merge_unique(
+            &mut merged,
+            vec![hit("乙(us)", "https://b"), hit("丙", "https://c")],
+        );
+        assert_eq!(
+            merged.iter().map(|h| h.title.as_str()).collect::<Vec<_>>(),
+            ["甲", "乙", "丙"]
+        );
     }
 }

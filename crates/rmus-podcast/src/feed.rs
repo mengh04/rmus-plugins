@@ -73,17 +73,17 @@ pub fn parse(xml: &str) -> anyhow::Result<FeedParsed> {
                 Event::CData(t) => {
                     if let Some(target) = &text_target {
                         let decoded = String::from_utf8_lossy(t.as_ref()).into_owned();
-                        push_text(&mut texts, target, &decoded.trim());
+                        push_text(&mut texts, target, decoded.trim());
                     }
                 }
                 Event::End(e) => {
                     let local = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
                     if local == "item" {
                         in_item = in_item.saturating_sub(1);
-                        if let Some(ep) = take_episode(&cur, &cur_attrs) {
-                            if episodes.len() < MAX_EPISODES {
-                                episodes.push(ep);
-                            }
+                        if let Some(ep) = take_episode(&cur, &cur_attrs)
+                            && episodes.len() < MAX_EPISODES
+                        {
+                            episodes.push(ep);
                         }
                         cur.clear();
                         cur_attrs.clear();
@@ -140,10 +140,10 @@ fn grab_attrs(
             attrs.insert("enclosure_length".into(), len);
         }
     }
-    if local == "image" {
-        if let Some(href) = value("href") {
-            attrs.insert("image_href".into(), href);
-        }
+    if local == "image"
+        && let Some(href) = value("href")
+    {
+        attrs.insert("image_href".into(), href);
     }
 }
 
@@ -192,7 +192,7 @@ fn take_episode(cur: &HashMap<String, String>, attrs: &HashMap<String, String>) 
 /// 容错精神，两种主流写法都接）。
 fn parse_duration(raw: &str) -> Option<u64> {
     let raw = raw.trim();
-    if let Some(secs) = raw.parse::<u64>().ok() {
+    if let Ok(secs) = raw.parse::<u64>() {
         return Some(secs * 1000);
     }
     let parts: Vec<u64> = raw

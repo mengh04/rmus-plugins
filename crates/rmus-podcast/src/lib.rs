@@ -42,6 +42,9 @@ const DOWNLOAD_TASK_BASE: u64 = 1000;
 const SEARCH_TASK_BASE: u64 = 50_000;
 const WORKER_TASK: u64 = 7;
 
+/// 搜索结果每页条数（iTunes 一次拉满，翻页在本地切）
+const SEARCH_PAGE: usize = 25;
+
 /// 下载中的行（内存态；完成后落到 Episode.downloaded）。
 struct Download {
     task_id: u64,
@@ -84,6 +87,8 @@ struct UiState {
     input: Option<Input>,
     /// 搜索结果（View::Search 的内容）
     hits: Vec<search::Hit>,
+    /// 当前结果页（0 起；每页 SEARCH_PAGE 条）
+    page: usize,
     hit_sel: usize,
     hit_scroll: usize,
     /// 在途搜索任务号（None = 没有正在跑的搜索）
@@ -133,6 +138,7 @@ impl UiState {
             eps_scroll: 0,
             input: None,
             hits: Vec::new(),
+            page: 0,
             hit_sel: 0,
             hit_scroll: 0,
             search_task: None,
@@ -182,6 +188,7 @@ impl UiState {
         if task::spawn(task_id, "search_podcasts", &spec) {
             self.search_task = Some(task_id);
             self.hits.clear();
+            self.page = 0;
             self.hit_sel = 0;
             self.hit_scroll = 0;
             self.query = query.to_string();
@@ -191,6 +198,17 @@ impl UiState {
             self.status = Some("宿主拒绝搜索任务".into());
             false
         }
+    }
+
+    /// 结果总页数（至少 1，便于显示"第 1/1 页"）。
+    fn page_count(&self) -> usize {
+        self.hits.len().div_ceil(SEARCH_PAGE).max(1)
+    }
+
+    /// 当前页条数。
+    fn page_len(&self) -> usize {
+        let start = self.page * SEARCH_PAGE;
+        self.hits.len().saturating_sub(start).min(SEARCH_PAGE)
     }
 }
 
@@ -280,16 +298,23 @@ pub extern "C" fn update(ev: i32) -> i32 {
 
     match kind(ev) {
         KIND_DATA => on_data(),
-        KIND_UP => {
-            with_ui(|s| match s.view {
+        KIND_UP => with_ui(|s| {
+            // 输入态下方向键不挪背后列表（避免打字时选中项乱跑）
+            if s.input.is_some() {
+                return 0;
+            }
+            match s.view {
                 View::Subs => s.subs_sel = s.subs_sel.saturating_sub(1),
                 View::Eps => s.eps_sel = s.eps_sel.saturating_sub(1),
                 View::Search => s.hit_sel = s.hit_sel.saturating_sub(1),
-            });
+            }
             1
-        }
-        KIND_DOWN => {
-            with_ui(|s| match s.view {
+        }),
+        KIND_DOWN => with_ui(|s| {
+            if s.input.is_some() {
+                return 0;
+            }
+            match s.view {
                 View::Subs => {
                     if s.subs_sel + 1 < s.store.podcasts.len() {
                         s.subs_sel += 1;
@@ -302,13 +327,13 @@ pub extern "C" fn update(ev: i32) -> i32 {
                     }
                 }
                 View::Search => {
-                    if s.hit_sel + 1 < s.hits.len() {
+                    if s.hit_sel + 1 < s.page_len() {
                         s.hit_sel += 1;
                     }
                 }
-            });
+            }
             1
-        }
+        }),
         KIND_BACKSPACE => with_ui(|s| {
             let Some(input) = s.input.as_mut() else {
                 return 0;
@@ -392,8 +417,38 @@ pub extern "C" fn update(ev: i32) -> i32 {
                 return 0;
             }
             match ch {
-                'j' => return update(encode(KIND_DOWN, 0)),
-                'k' => return update(encode(KIND_UP, 0)),
+                'j' => update(encode(KIND_DOWN, 0)),
+                'k' => update(encode(KIND_UP, 0)),
+                // Shift+H / Shift+L：搜索结果翻页（iTunes 不支持 offset，
+                // 结果一次拉满后在本地切页）
+                'H' => with_ui(|s| {
+                    if s.view != View::Search {
+                        return 0;
+                    }
+                    if s.page == 0 {
+                        s.status = Some("已经是第一页".into());
+                        return 1;
+                    }
+                    s.page -= 1;
+                    s.hit_sel = 0;
+                    s.hit_scroll = 0;
+                    s.status = None;
+                    1
+                }),
+                'L' => with_ui(|s| {
+                    if s.view != View::Search {
+                        return 0;
+                    }
+                    if s.page + 1 >= s.page_count() {
+                        s.status = Some("已经是最后一页".into());
+                        return 1;
+                    }
+                    s.page += 1;
+                    s.hit_sel = 0;
+                    s.hit_scroll = 0;
+                    s.status = None;
+                    1
+                }),
                 's' | '/' => {
                     with_ui(|s| {
                         s.input = Some(Input {
@@ -571,7 +626,7 @@ fn play_selected(s: &mut UiState) -> i32 {
 
 /// 搜索结果页 Enter：订阅选中命中（走 fetch_feed，与手贴 RSS 同一条链路）。
 fn subscribe_selected(s: &mut UiState) -> i32 {
-    let Some(hit) = s.hits.get(s.hit_sel).cloned() else {
+    let Some(hit) = s.hits.get(s.page * SEARCH_PAGE + s.hit_sel).cloned() else {
         return 0;
     };
     if s.store.podcasts.iter().any(|p| p.feed_url == hit.feed_url) {
@@ -819,7 +874,7 @@ pub extern "C" fn render(rows: i32, cols: i32) {
             }
             spans.push(ui::span(
                 style::FAINT,
-                "  ·  s 搜索 · a 贴 RSS · Enter 单集 · x 退订",
+                "  ·  i 直通：s 搜索 · a 贴 RSS · Enter 单集 · x 退订",
             ));
             ui::print_line(&spans);
         }
@@ -851,17 +906,28 @@ pub extern "C" fn render(rows: i32, cols: i32) {
         }
         (View::Search, _) => {
             let n = s.hits.len();
+            let pages = s.page_count();
             let mut spans = vec![
                 ui::span(style::STRONG, format!("搜索“{}”", s.query)),
                 ui::span(style::FAINT, format!("  ·  {n} 个结果")),
             ];
+            if pages > 1 {
+                spans.push(ui::span(
+                    style::FAINT,
+                    format!("  ·  第 {}/{} 页", s.page + 1, pages),
+                ));
+            }
             if s.search_task.is_some() {
                 spans.push(ui::span(style::ACCENT, "  ·  搜索中…"));
             }
             if let Some(msg) = s.status.take() {
                 spans.push(ui::span(style::ACCENT, format!("  ·  {msg}")));
             }
-            spans.push(ui::span(style::FAINT, "  ·  Enter 订阅 · h 返回"));
+            if pages > 1 {
+                spans.push(ui::span(style::FAINT, "  ·  Enter 订阅 · H/L 翻页 · h 返回"));
+            } else {
+                spans.push(ui::span(style::FAINT, "  ·  Enter 订阅 · h 返回"));
+            }
             ui::print_line(&spans);
         }
     }
@@ -956,13 +1022,15 @@ fn render_search(s: &mut UiState, width: usize, rows: i32) {
         return;
     }
 
+    let start = s.page * SEARCH_PAGE;
+    let end = (start + SEARCH_PAGE).min(s.hits.len());
+    let total = end - start;
     let list_h = (rows.max(4) as usize).saturating_sub(3);
-    let total = s.hits.len();
     let first = ui::window(&mut s.hit_scroll, s.hit_sel, total, list_h);
     ui::set_selected(3 + s.hit_sel - first);
 
-    let hits = s.hits.clone();
-    for (i, hit) in hits[first..].iter().take(list_h).enumerate() {
+    let page_hits = s.hits[start..end].to_vec();
+    for (i, hit) in page_hits[first..].iter().take(list_h).enumerate() {
         let i = first + i;
         let selected = i == s.hit_sel;
         let title_style = if selected { style::STRONG } else { style::BASE };
@@ -972,7 +1040,7 @@ fn render_search(s: &mut UiState, width: usize, rows: i32) {
             .iter()
             .any(|p| p.feed_url == hit.feed_url);
         ui::print_line(&[
-            ui::span(style::FAINT, ui::pad_left(&(i + 1).to_string(), 3)),
+            ui::span(style::FAINT, ui::pad_left(&(start + i + 1).to_string(), 3)),
             ui::span(
                 title_style,
                 format!("  {}", ui::pad_right(&hit.title, title_w.saturating_sub(3))),
@@ -1032,11 +1100,9 @@ fn render_eps(s: &mut UiState, width: usize, rows: i32) {
         } else if ep.played {
             ("已播".into(), style::FAINT)
         } else if ep.in_progress() {
-            let pct = if ep.duration_ms > 0 {
-                (ep.position_ms * 100 / ep.duration_ms).min(99)
-            } else {
-                0
-            };
+            let pct = (ep.position_ms * 100)
+                .checked_div(ep.duration_ms)
+                .map_or(0, |p| p.min(99));
             (format!("▶ {pct}%"), style::ACCENT)
         } else if ep.downloaded.is_some() {
             ("⤓ 本地".into(), style::OK)
@@ -1108,14 +1174,16 @@ fn podcast_worker() -> anyhow::Result<serde_json::Value> {
             // 窗口取 1.2s（> 1s 采样间隔，必命中一次；播客砍 ~1s 片尾无感）。
             // 预切后多睡 2s：引擎切队列是异步的，避免下轮采样对旧集重复 Peek。
             let remaining = duration.saturating_sub(position);
-            if playing && duration > 0 && remaining <= 1200 {
-                if let Some(next) = store.next_episode(&feed_url, &guid)
-                    && let Some(next_path) = store.episode_path(Path::new(&data_dir), &store.podcasts[pi], next)
-                {
-                    let _ = daemon::peek(vec![next_path.display().to_string()]);
-                    rmus_plugin_sdk::notify(&serde_json::json!({ "worker": "advance" }));
-                    rmus_plugin_sdk::sleep(2000);
-                }
+            if playing
+                && duration > 0
+                && remaining <= 1200
+                && let Some(next) = store.next_episode(&feed_url, &guid)
+                && let Some(next_path) =
+                    store.episode_path(Path::new(&data_dir), &store.podcasts[pi], next)
+            {
+                let _ = daemon::peek(vec![next_path.display().to_string()]);
+                rmus_plugin_sdk::notify(&serde_json::json!({ "worker": "advance" }));
+                rmus_plugin_sdk::sleep(2000);
             }
             let _ = podcasts_root;
         } else if let Some((feed_url, guid, last_pos, last_dur)) = state.playing.take() {

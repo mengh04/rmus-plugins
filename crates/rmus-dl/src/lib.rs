@@ -373,8 +373,8 @@ fn ui_update(ev: i32) -> i32 {
         }
         KIND_CHAR => {
             match char_of(ev) {
-                Some('j') => return ui_update(rmus_plugin_sdk::event::encode(rmus_plugin_sdk::event::KIND_DOWN, 0)),
-                Some('k') => return ui_update(rmus_plugin_sdk::event::encode(rmus_plugin_sdk::event::KIND_UP, 0)),
+                Some('j') => ui_update(rmus_plugin_sdk::event::encode(rmus_plugin_sdk::event::KIND_DOWN, 0)),
+                Some('k') => ui_update(rmus_plugin_sdk::event::encode(rmus_plugin_sdk::event::KIND_UP, 0)),
                 Some('d') => {
                     // 下载选中项：worker 实例跑 download task
                     let song = with_ui(|s| {
@@ -399,7 +399,7 @@ fn ui_update(ev: i32) -> i32 {
                         });
                         id
                     });
-                    return if task::spawn(
+                    if task::spawn(
                         task_id,
                         "download",
                         &serde_json::json!({"song": song}),
@@ -412,7 +412,7 @@ fn ui_update(ev: i32) -> i32 {
                             }
                         });
                         1
-                    };
+                    }
                 }
                 Some('x') => {
                     // 取消最近一个进行中的下载
@@ -425,11 +425,12 @@ fn ui_update(ev: i32) -> i32 {
                     });
                     if let Some(id) = running {
                         task::cancel(id);
-                        return 1;
+                        1
+                    } else {
+                        0
                     }
-                    return 0;
                 }
-                _ => return 0,
+                _ => 0,
             }
         }
         _ => 0,
