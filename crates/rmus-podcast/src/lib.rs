@@ -25,7 +25,7 @@ use store::{Episode, Store};
 use ui::style;
 
 declare_plugin_manifest! {
-    name: "rmus-podcast", version: "0.3.2", ui: true, tab: "播客",
+    name: "rmus-podcast", version: "0.3.3", ui: true, tab: "播客",
     methods: [
         ("fetch_feed", "task"),
         ("search_podcasts", "task"),
@@ -78,19 +78,20 @@ struct UiState {
     store: Store,
     data_dir: PathBuf,
     view: View,
-    subs_sel: usize,
-    eps_sel: usize,
-    /// 两级视图各自的窗口滚动（切换后各自保留）
-    subs_scroll: usize,
-    eps_scroll: usize,
+    /// 三级列表各自的光标/窗口（切换后各自保留）。导航与窗口计算走
+    /// SDK 的 ListState，与宿主其他列表同一套语义。
+    subs: ui::ListState,
+    eps: ui::ListState,
+    /// 最近一次 render 的画布高度（半页导航用）
+    view_rows: usize,
     /// a 键的 feed URL 输入态 / s 键的搜索词输入态（None = 非输入态）
     input: Option<Input>,
     /// 搜索结果（View::Search 的内容）
     hits: Vec<search::Hit>,
     /// 当前结果页（0 起；每页 SEARCH_PAGE 条）
     page: usize,
-    hit_sel: usize,
-    hit_scroll: usize,
+    /// 当前结果页的光标/窗口
+    hit_list: ui::ListState,
     /// 在途搜索任务号（None = 没有正在跑的搜索）
     search_task: Option<u64>,
     /// 结果页标题里的关键词
@@ -132,15 +133,13 @@ impl UiState {
             store,
             data_dir: dir,
             view: View::Subs,
-            subs_sel: 0,
-            eps_sel: 0,
-            subs_scroll: 0,
-            eps_scroll: 0,
+            subs: ui::ListState::new(),
+            eps: ui::ListState::new(),
+            view_rows: 24,
             input: None,
             hits: Vec::new(),
             page: 0,
-            hit_sel: 0,
-            hit_scroll: 0,
+            hit_list: ui::ListState::new(),
             search_task: None,
             query: String::new(),
             status: None,
@@ -189,8 +188,7 @@ impl UiState {
             self.search_task = Some(task_id);
             self.hits.clear();
             self.page = 0;
-            self.hit_sel = 0;
-            self.hit_scroll = 0;
+            self.hit_list = ui::ListState::new();
             self.query = query.to_string();
             self.view = View::Search;
             true
@@ -293,47 +291,33 @@ fn fetch_feed(params: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
 #[unsafe(no_mangle)]
 pub extern "C" fn update(ev: i32) -> i32 {
     use rmus_plugin_sdk::event::{
-        char_of, encode, kind, KIND_BACKSPACE, KIND_CHAR, KIND_DATA, KIND_DOWN, KIND_ENTER, KIND_UP,
+        char_of, encode, kind, KIND_BACKSPACE, KIND_BOTTOM, KIND_CHAR, KIND_DATA, KIND_DOWN,
+        KIND_ENTER, KIND_HALF_DOWN, KIND_HALF_UP, KIND_TOP, KIND_UP,
     };
 
     match kind(ev) {
         KIND_DATA => on_data(),
-        KIND_UP => with_ui(|s| {
-            // 输入态下方向键不挪背后列表（避免打字时选中项乱跑）
-            if s.input.is_some() {
-                return 0;
-            }
-            match s.view {
-                View::Subs => s.subs_sel = s.subs_sel.saturating_sub(1),
-                View::Eps => s.eps_sel = s.eps_sel.saturating_sub(1),
-                View::Search => s.hit_sel = s.hit_sel.saturating_sub(1),
-            }
-            1
-        }),
-        KIND_DOWN => with_ui(|s| {
-            if s.input.is_some() {
-                return 0;
-            }
-            match s.view {
-                View::Subs => {
-                    if s.subs_sel + 1 < s.store.podcasts.len() {
-                        s.subs_sel += 1;
-                    }
+        // 上下 / 首尾 / 半页：宿主只发语义事件，光标与窗口归 ListState
+        KIND_UP | KIND_DOWN | KIND_TOP | KIND_BOTTOM | KIND_HALF_UP | KIND_HALF_DOWN => {
+            with_ui(|s| {
+                // 输入态下导航键不挪背后列表（避免打字时选中项乱跑）
+                if s.input.is_some() {
+                    return 0;
                 }
-                View::Eps => {
-                    let len = current_episodes(s).len();
-                    if s.eps_sel + 1 < len {
-                        s.eps_sel += 1;
-                    }
-                }
-                View::Search => {
-                    if s.hit_sel + 1 < s.page_len() {
-                        s.hit_sel += 1;
-                    }
-                }
-            }
-            1
-        }),
+                let page = (s.view_rows / 2).max(1);
+                let len = match s.view {
+                    View::Subs => s.store.podcasts.len(),
+                    View::Eps => current_episodes(s).len(),
+                    View::Search => s.page_len(),
+                };
+                let list = match s.view {
+                    View::Subs => &mut s.subs,
+                    View::Eps => &mut s.eps,
+                    View::Search => &mut s.hit_list,
+                };
+                list.handle(ev, len, page) as i32
+            })
+        }
         KIND_BACKSPACE => with_ui(|s| {
             let Some(input) = s.input.as_mut() else {
                 return 0;
@@ -388,11 +372,11 @@ pub extern "C" fn update(ev: i32) -> i32 {
                     let feed_url = s
                         .store
                         .podcasts
-                        .get(s.subs_sel)
+                        .get(s.subs.selected)
                         .map(|p| p.feed_url.clone());
                     if let Some(feed_url) = feed_url {
                         s.view = View::Eps;
-                        s.eps_sel = 0;
+                        s.eps = ui::ListState::new();
                         s.spawn_fetch(&feed_url);
                         return 1;
                     }
@@ -430,8 +414,8 @@ pub extern "C" fn update(ev: i32) -> i32 {
                         return 1;
                     }
                     s.page -= 1;
-                    s.hit_sel = 0;
-                    s.hit_scroll = 0;
+                    s.hit_list.selected = 0;
+                    s.hit_list.scroll = 0;
                     s.status = None;
                     1
                 }),
@@ -444,8 +428,8 @@ pub extern "C" fn update(ev: i32) -> i32 {
                         return 1;
                     }
                     s.page += 1;
-                    s.hit_sel = 0;
-                    s.hit_scroll = 0;
+                    s.hit_list.selected = 0;
+                    s.hit_list.scroll = 0;
                     s.status = None;
                     1
                 }),
@@ -488,9 +472,9 @@ pub extern "C" fn update(ev: i32) -> i32 {
                             return 0;
                         }
                         let (_feed_url, _slug, spec) = {
-                            let pi = s.subs_sel.min(s.store.podcasts.len().saturating_sub(1));
+                            let pi = s.subs.selected.min(s.store.podcasts.len().saturating_sub(1));
                             let pod = &s.store.podcasts[pi];
-                            let Some(ep) = pod.episodes.get(s.eps_sel) else {
+                            let Some(ep) = pod.episodes.get(s.eps.selected) else {
                                 return 0;
                             };
                             if ep.downloaded.is_some() {
@@ -508,7 +492,7 @@ pub extern "C" fn update(ev: i32) -> i32 {
                                 }),
                             )
                         };
-                        let sel = s.eps_sel;
+                        let sel = s.eps.selected;
                         let guid = current_episodes(s)
                             .get(sel)
                             .map(|e| e.guid.clone())
@@ -537,7 +521,7 @@ pub extern "C" fn update(ev: i32) -> i32 {
                         if s.view != View::Eps {
                             return 0;
                         }
-                        let sel = s.eps_sel;
+                        let sel = s.eps.selected;
                         let Some(ep) = current_episodes(s).get_mut(sel) else {
                             return 0;
                         };
@@ -551,10 +535,10 @@ pub extern "C" fn update(ev: i32) -> i32 {
                 'x' => {
                     with_ui(|s| {
                         if s.view == View::Subs
-                            && s.subs_sel < s.store.podcasts.len()
+                            && s.subs.selected < s.store.podcasts.len()
                         {
-                            let p = s.store.podcasts.remove(s.subs_sel);
-                            s.subs_sel = s.subs_sel.min(s.store.podcasts.len().saturating_sub(1));
+                            let p = s.store.podcasts.remove(s.subs.selected);
+                            s.subs.selected = s.subs.selected.min(s.store.podcasts.len().saturating_sub(1));
                             s.save();
                             s.status = Some(format!("已退订：{}", p.title));
                             return 1;
@@ -572,10 +556,10 @@ pub extern "C" fn update(ev: i32) -> i32 {
 /// Enter 播放选中集：已下载直接试听态播放；未下载先发起下载并预约
 /// 播放（done 事件里自动开播）。
 fn play_selected(s: &mut UiState) -> i32 {
-    let pi = s.subs_sel.min(s.store.podcasts.len().saturating_sub(1));
+    let pi = s.subs.selected.min(s.store.podcasts.len().saturating_sub(1));
     let (feed_url, slug, ep_info) = {
         let pod = &s.store.podcasts[pi];
-        let Some(ep) = pod.episodes.get(s.eps_sel) else {
+        let Some(ep) = pod.episodes.get(s.eps.selected) else {
             return 0;
         };
         (
@@ -629,7 +613,7 @@ fn play_selected(s: &mut UiState) -> i32 {
 
 /// 搜索结果页 Enter：订阅选中命中（走 fetch_feed，与手贴 RSS 同一条链路）。
 fn subscribe_selected(s: &mut UiState) -> i32 {
-    let Some(hit) = s.hits.get(s.page * SEARCH_PAGE + s.hit_sel).cloned() else {
+    let Some(hit) = s.hits.get(s.page * SEARCH_PAGE + s.hit_list.selected).cloned() else {
         return 0;
     };
     if s.store.podcasts.iter().any(|p| p.feed_url == hit.feed_url) {
@@ -658,7 +642,7 @@ fn ensure_worker() {
 
 /// 当前单集视图对应的播客单集（可变借用侧写）。
 fn current_episodes(s: &mut UiState) -> &mut Vec<Episode> {
-    let idx = s.subs_sel.min(s.store.podcasts.len().saturating_sub(1));
+    let idx = s.subs.selected.min(s.store.podcasts.len().saturating_sub(1));
     &mut s.store.podcasts[idx].episodes
 }
 
@@ -720,8 +704,8 @@ fn on_data() -> i32 {
                     let n = hits.len();
                     s.search_task = None;
                     s.hits = hits;
-                    s.hit_sel = 0;
-                    s.hit_scroll = 0;
+                    s.hit_list.selected = 0;
+                    s.hit_list.scroll = 0;
                     s.status = (n == 0).then(|| "没有找到播客".to_string());
                 }
                 "failed" => {
@@ -829,8 +813,8 @@ fn on_data() -> i32 {
                     && let Some(idx) = s.store.podcasts.iter().position(|p| p.feed_url == feed_url)
                 {
                     s.view = View::Eps;
-                    s.subs_sel = idx;
-                    s.eps_sel = 0;
+                    s.subs.selected = idx;
+                    s.eps = ui::ListState::new();
                 }
             });
             1
@@ -863,6 +847,7 @@ pub extern "C" fn render(rows: i32, cols: i32) {
         ui::print_line(&[ui::span(style::STRONG, "按 i 进入直通后：a 贴 RSS · s 搜索")]);
         return;
     };
+    s.view_rows = rows.max(4) as usize;
 
     // 头行：标题/输入态/状态消息
     match (&s.view, &s.input) {
@@ -893,7 +878,7 @@ pub extern "C" fn render(rows: i32, cols: i32) {
             ui::print_line(&spans);
         }
         (View::Eps, _) => {
-            let idx = s.subs_sel.min(s.store.podcasts.len().saturating_sub(1));
+            let idx = s.subs.selected.min(s.store.podcasts.len().saturating_sub(1));
             let (title, n, fetching) = match s.store.podcasts.get(idx) {
                 Some(p) => (
                     p.title.clone(),
@@ -961,6 +946,7 @@ pub extern "C" fn render(rows: i32, cols: i32) {
 /// 订阅列表：标题<flex> 作者<16> 单集<5> 未播<5>。
 fn render_subs(s: &mut UiState, width: usize, rows: i32) {
     if s.store.podcasts.is_empty() {
+        s.subs.prepare(0, 1, 3);
         ui::print_line(&[
             ui::span(style::FAINT, "还没有订阅。按 "),
             ui::span(style::ACCENT, "i"),
@@ -988,13 +974,12 @@ fn render_subs(s: &mut UiState, width: usize, rows: i32) {
 
     let list_h = (rows.max(4) as usize).saturating_sub(3);
     let total = s.store.podcasts.len();
-    let first = ui::window(&mut s.subs_scroll, s.subs_sel, total, list_h);
-    ui::set_selected(3 + s.subs_sel - first);
+    let first = s.subs.prepare(total, list_h, 3);
 
     let snapshot: Vec<_> = s.store.podcasts.clone();
     for (i, p) in snapshot[first..].iter().take(list_h).enumerate() {
         let i = first + i;
-        let selected = i == s.subs_sel;
+        let selected = i == s.subs.selected;
         let title_style = if selected { style::STRONG } else { style::BASE };
         let unplayed = p.episodes.iter().filter(|e| !e.played).count();
         ui::print_line(&[
@@ -1024,6 +1009,7 @@ fn render_search(s: &mut UiState, width: usize, rows: i32) {
     ui::print_line(&[ui::span(style::RULE, "─".repeat(width))]);
 
     if s.hits.is_empty() {
+        s.hit_list.prepare(0, 1, 3);
         if s.search_task.is_some() {
             ui::print_line(&[ui::span(style::FAINT, "搜索中…")]);
         } else {
@@ -1040,13 +1026,12 @@ fn render_search(s: &mut UiState, width: usize, rows: i32) {
     let end = (start + SEARCH_PAGE).min(s.hits.len());
     let total = end - start;
     let list_h = (rows.max(4) as usize).saturating_sub(3);
-    let first = ui::window(&mut s.hit_scroll, s.hit_sel, total, list_h);
-    ui::set_selected(3 + s.hit_sel - first);
+    let first = s.hit_list.prepare(total, list_h, 3);
 
     let page_hits = s.hits[start..end].to_vec();
     for (i, hit) in page_hits[first..].iter().take(list_h).enumerate() {
         let i = first + i;
-        let selected = i == s.hit_sel;
+        let selected = i == s.hit_list.selected;
         let title_style = if selected { style::STRONG } else { style::BASE };
         let subscribed = s
             .store
@@ -1089,18 +1074,18 @@ fn render_eps(s: &mut UiState, width: usize, rows: i32) {
 
     let episodes: Vec<Episode> = current_episodes(s).clone();
     if episodes.is_empty() {
+        s.eps.prepare(0, 1, 3);
         ui::print_line(&[ui::span(style::FAINT, "没有单集（feed 为空或还在刷新）")]);
         return;
     }
 
     let list_h = (rows.max(4) as usize).saturating_sub(3);
     let total = episodes.len();
-    let first = ui::window(&mut s.eps_scroll, s.eps_sel, total, list_h);
-    ui::set_selected(3 + s.eps_sel - first);
+    let first = s.eps.prepare(total, list_h, 3);
 
     for (i, ep) in episodes[first..].iter().take(list_h).enumerate() {
         let i = first + i;
-        let selected = i == s.eps_sel;
+        let selected = i == s.eps.selected;
         let title_style = if selected { style::STRONG } else { style::BASE };
         let dl = s.downloads.iter().find(|d| d.guid == ep.guid);
         let (status_text, status_style): (String, &str) = if let Some(dl) = dl {

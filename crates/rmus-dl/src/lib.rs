@@ -27,7 +27,7 @@ const FLAC_ONLY: bool = true;
 const SEARCH_TASK: u64 = 1;
 
 declare_plugin_manifest! {
-    name: "rmus-dl", version: "0.3.0", ui: true, tab: "在线",
+    name: "rmus-dl", version: "0.3.1", ui: true, tab: "在线",
     methods: [("search", "call"), ("download", "task"), ("cancel", "call")],
     handle: handle,
 }
@@ -238,9 +238,10 @@ struct UiState {
     searching: bool,
     search_err: Option<String>,
     songs: Vec<serde_json::Value>,
-    selected: usize,
-    /// 结果列表的窗口滚动（画布自行滚动；TUI 全量投影画布行）
-    scroll: usize,
+    /// 结果列表的光标/窗口（导航与窗口计算走 SDK 共用语义）
+    list: ui::ListState,
+    /// 最近一次 render 的画布高度（半页导航用）
+    view_rows: usize,
     downloads: Vec<Download>,
     next_task: u64,
 }
@@ -252,9 +253,9 @@ impl UiState {
             searching: false,
             search_err: None,
             songs: Vec::new(),
-            selected: 0,
+            list: ui::ListState::new(),
+            view_rows: 24,
             downloads: Vec::new(),
-            scroll: 0,
             next_task: 100,
         }
     }
@@ -269,7 +270,10 @@ fn with_ui<R>(f: impl FnOnce(&mut UiState) -> R) -> R {
 }
 
 fn ui_update(ev: i32) -> i32 {
-    use rmus_plugin_sdk::event::{char_of, kind, KIND_CHAR, KIND_DATA, KIND_DOWN, KIND_UP};
+    use rmus_plugin_sdk::event::{
+        char_of, kind, KIND_BOTTOM, KIND_CHAR, KIND_DATA, KIND_DOWN, KIND_HALF_DOWN, KIND_HALF_UP,
+        KIND_TOP, KIND_UP,
+    };
 
     match kind(ev) {
         KIND_DATA => {
@@ -289,7 +293,7 @@ fn ui_update(ev: i32) -> i32 {
                     s.searching = true;
                     s.search_err = None;
                     s.songs.clear();
-                    s.selected = 0;
+                    s.list = ui::ListState::new();
                 });
                 return if task::spawn(SEARCH_TASK, "search", &serde_json::json!({"query": query})) {
                     1
@@ -315,7 +319,7 @@ fn ui_update(ev: i32) -> i32 {
                         with_ui(|s| {
                             s.searching = false;
                             s.songs = songs;
-                            s.selected = 0;
+                            s.list = ui::ListState::new();
                         });
                         return 1;
                     }
@@ -359,17 +363,12 @@ fn ui_update(ev: i32) -> i32 {
             }
             0
         }
-        KIND_UP => {
-            with_ui(|s| s.selected = s.selected.saturating_sub(1));
-            1
-        }
-        KIND_DOWN => {
+        KIND_UP | KIND_DOWN | KIND_TOP | KIND_BOTTOM | KIND_HALF_UP | KIND_HALF_DOWN => {
             with_ui(|s| {
-                if s.selected + 1 < s.songs.len() {
-                    s.selected += 1;
-                }
-            });
-            1
+                let len = s.songs.len();
+                let page = (s.view_rows / 2).max(1);
+                s.list.handle(ev, len, page) as i32
+            })
         }
         KIND_CHAR => {
             match char_of(ev) {
@@ -378,7 +377,7 @@ fn ui_update(ev: i32) -> i32 {
                 Some('d') => {
                     // 下载选中项：worker 实例跑 download task
                     let song = with_ui(|s| {
-                        match s.songs.get(s.selected) {
+                        match s.songs.get(s.list.selected) {
                             Some(song) => song.clone(),
                             None => serde_json::Value::Null,
                         }
@@ -455,6 +454,7 @@ pub extern "C" fn render(rows: i32, cols: i32) {
         ]);
         return;
     };
+    s.view_rows = rows.max(4) as usize;
 
     // 第一行：关键词 + 结果数（搜索中/失败时给状态）
     if let Some(err) = &s.search_err {
@@ -518,14 +518,15 @@ pub extern "C" fn render(rows: i32, cols: i32) {
     ui::print_line(&[ui::span(style::RULE, "─".repeat(width as usize))]);
 
     if s.searching {
+        // 搜索中结果已清空：向宿主声明空列表，别沿用上一次的计数
+        s.list.prepare(0, 1, 3);
         return;
     }
 
     // 结果行窗口化：画布高度减去头部 3 行（搜索行/列标题/分隔线），
     // 选中行始终滚入窗口；选中画布行号声明给宿主（铺选中底色）
     let list_h = (rows.max(4) as usize).saturating_sub(3);
-    let first = ui::window(&mut s.scroll, s.selected, s.songs.len(), list_h);
-    ui::set_selected(3 + s.selected - first);
+    let first = s.list.prepare(s.songs.len(), list_h, 3);
 
     // 结果行（列布局；时长列被下载状态覆盖：… / 47% / ✓ / ✗；
     // 下载中的行按已收比例画绿色进度条）
@@ -536,7 +537,7 @@ pub extern "C" fn render(rows: i32, cols: i32) {
         let album = song["album"].as_str().unwrap_or("");
         let source = song["source"].as_str().unwrap_or("?");
         let song_id = song["song_id"].as_str().unwrap_or("");
-        let selected = i == s.selected;
+        let selected = i == s.list.selected;
         let title_style = if selected { style::STRONG } else { style::BASE };
 
         // 行首空位：index 列右对齐（行背景由宿主画，空格自然带底色）

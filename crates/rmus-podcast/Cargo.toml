@@ -1,6 +1,6 @@
 [package]
 name = "rmus-podcast"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 description = "rmus wasm 播客插件：RSS 订阅 / 单集浏览 / 下载与连播"
 license = "MIT"
