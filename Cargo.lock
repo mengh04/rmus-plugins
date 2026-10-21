@@ -169,7 +169,7 @@ dependencies = [
 [[package]]
 name = "rmus-plugin-sdk"
 version = "0.1.0"
-source = "git+https://github.com/mengh04/rmus?branch=main#4047cab138283a7a8c41b7ade211a4eeb7d327d6"
+source = "git+https://github.com/mengh04/rmus?branch=main#744f19483076a05baca48380ce714dc73e9348b7"
 dependencies = [
  "anyhow",
  "lofty",
