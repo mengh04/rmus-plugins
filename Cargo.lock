@@ -156,7 +156,7 @@ dependencies = [
 
 [[package]]
 name = "rmus-dl"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -169,7 +169,6 @@ dependencies = [
 [[package]]
 name = "rmus-plugin-sdk"
 version = "0.1.0"
-source = "git+https://github.com/mengh04/rmus?branch=main#4047cab138283a7a8c41b7ade211a4eeb7d327d6"
 dependencies = [
  "anyhow",
  "lofty",

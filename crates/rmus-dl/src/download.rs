@@ -82,12 +82,18 @@ fn build_final_path(
     };
     drop(input);
 
-    // 读 tag 决定文件名
+    // 读 tag 决定文件名：tag 优于搜索文本，但退化 tag（空或 title==artist，
+    // 如酷我 CDN 自带 "kuwo"/"kuwo"）不可信，退回 fallback_name
     let mut input = fs::File::open(&temp_str)?;
     let tagged_file = Probe::new(&mut input).set_file_type(ext.1).read()?;
-    let final_path = if let Some(tag) = tagged_file.primary_tag()
-        && let (Some(title), Some(artist)) = (tag.title(), tag.artist())
-    {
+    let tagged = tagged_file
+        .primary_tag()
+        .and_then(|tag| {
+            let (title, artist) = (tag.title()?, tag.artist()?);
+            (!title.is_empty() && !artist.is_empty() && title != artist)
+                .then(|| (title.to_string(), artist.to_string()))
+        });
+    let final_path = if let Some((title, artist)) = tagged {
         dest_dir.join(format!("{title} - {artist}.{}", ext.0))
     } else {
         dest_dir.join(format!("{}.{}", sanitize_filename(fallback_name), ext.0))

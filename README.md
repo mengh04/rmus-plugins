@@ -5,10 +5,10 @@ music player. Each plugin is a wasm32 core module loaded by `rmusd` and drawn on
 its own tab; drop it in, restart, and the tab appears. Remove it and the tab
 disappears with it.
 
-| crate | tab | what it does |
-| --- | --- | --- |
-| [`rmus-dl`](crates/rmus-dl) | `在线` | search and download from kuwo / kugou, tags and cover art written on the way in |
-| [`rmus-podcast`](crates/rmus-podcast) | `播客` | search (iTunes directory) and RSS subscriptions, episode browsing, download and continuous playback |
+| crate | tab | CLI entry | what it does |
+| --- | --- | --- | --- |
+| [`rmus-dl`](crates/rmus-dl) | `在线` | `rmus -dl` | search and download from kuwo / kugou, tags and cover art written on the way in |
+| [`rmus-podcast`](crates/rmus-podcast) | `播客` | — | search (iTunes directory) and RSS subscriptions, episode browsing, download and continuous playback |
 
 ## Build
 
@@ -57,6 +57,9 @@ local checkout instead of pushing the host first:
 [patch."https://github.com/mengh04/rmus"]
 rmus-plugin-sdk = { path = "../rmus/crates/plugin-sdk" }
 ```
+
+> The `cli` manifest field (rmus-dl's `rmus -dl` entry) currently lives on a
+> local `rmus` branch — keep this patch until that lands upstream.
 
 The host side of the contract (capability functions, event encoding, render
 channel) is documented in
