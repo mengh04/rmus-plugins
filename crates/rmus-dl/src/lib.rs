@@ -320,13 +320,13 @@ fn finish_download<S: MusicSource>(
             notify(&serde_json::json!({"received": received, "total": total}));
         },
     };
-    let file_path = download::download_file(&url, &fallback_name, &mut opts)?;
+    let file_path = download::download_file(&url, &fallback_name, search_result, &mut opts)?;
 
     // 元数据是门禁：拿不到或写不进去，这次下载就算失败，清理产物
     notify(&serde_json::json!({"phase": "metadata"}));
     let meta_result = source
         .get_metadata(search_result)
-        .and_then(|meta| write_metadata(&file_path, &meta, probe.is_flac));
+        .and_then(|meta| write_metadata(&file_path, &meta, search_result, probe.is_flac));
     if let Err(e) = meta_result {
         let path_str = file_path.display().to_string();
         if !fs::remove(&path_str) {
