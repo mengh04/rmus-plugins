@@ -158,12 +158,45 @@ pub(crate) trait MusicSource {
     fn get_metadata(&self, song: &SearchResult) -> Result<SongMetadata>;
 }
 
-/// 把歌词和封面写进音频文件的 tag（lofty 经 SDK File 的 IO 代理）。
-/// `is_flac` 定显式 FileType——temp/无扩展名文件的自行探测会失败
-/// （rmus-dl 同款坑）。门禁：没有歌词也没有封面时直接失败；写入后读回验证。
+/// 歌手串的常见分隔符：酷我用 "&"、酷狗用 "、"，CDN tag 里还见 "/"、","。
+pub(crate) const ARTIST_SEPARATORS: [char; 7] = ['&', '、', '/', ',', '，', ';', '；'];
+
+/// 拆分歌手串，去首尾空白与空项。
+pub(crate) fn split_artists(s: &str) -> impl Iterator<Item = &str> {
+    s.split(ARTIST_SEPARATORS)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
+/// 歌手串统一用 "&" 连接，文件名与 ARTIST 标签保持一致。
+pub(crate) fn normalize_artists(s: &str) -> String {
+    split_artists(s).collect::<Vec<_>>().join("&")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_artists;
+
+    #[test]
+    fn artist_separators_normalize_to_ampersand() {
+        assert_eq!(normalize_artists("胡夏/郁可唯"), "胡夏&郁可唯");
+        assert_eq!(normalize_artists("胡夏、郁可唯"), "胡夏&郁可唯");
+        assert_eq!(normalize_artists("胡夏&郁可唯"), "胡夏&郁可唯");
+        assert_eq!(normalize_artists("胡夏， 郁可唯"), "胡夏&郁可唯");
+        assert_eq!(normalize_artists("郁可唯"), "郁可唯");
+        assert_eq!(normalize_artists(""), "");
+    }
+}
+
+/// 把标题/歌手/专辑/歌词/封面写进音频文件的 tag（lofty 经 SDK File 的 IO 代理）。
+/// 基础信息以搜索结果为准——CDN 自带 tag 常不完整（合唱只写第一个歌手），
+/// 搜索文本是用户确认过的展示文本。`is_flac` 定显式 FileType——temp/无扩展名
+/// 文件的自行探测会失败（rmus-dl 同款坑）。门禁：没有歌词也没有封面时直接
+/// 失败；写入后读回验证。
 pub(crate) fn write_metadata(
     file_path: &Path,
     meta: &SongMetadata,
+    search: &SearchResult,
     is_flac: bool,
 ) -> Result<()> {
     use lofty::{
@@ -193,6 +226,25 @@ pub(crate) fn write_metadata(
         lofty::tag::TagType::Id3v2 => ItemKey::UnsyncLyrics,
         _ => ItemKey::Lyrics,
     };
+
+    // 基础信息覆盖 CDN 自带的残缺 tag（insert_text 替换同 key 旧值）
+    tag.insert_text(ItemKey::TrackTitle, search.title.clone());
+    if let Some(artist) = search
+        .artist
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+    {
+        tag.insert_text(ItemKey::TrackArtist, normalize_artists(artist));
+    }
+    if let Some(album) = search
+        .album
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+    {
+        tag.insert_text(ItemKey::AlbumTitle, album.to_string());
+    }
 
     if let Some(lyric) = &meta.lyric {
         tag.insert_text(lyrics_key, lyric.clone());
@@ -229,6 +281,20 @@ pub(crate) fn write_metadata(
     }
     if meta.cover_url.is_some() && tag.pictures().is_empty() {
         anyhow::bail!("verification failed: picture missing from tag after save");
+    }
+    if tag
+        .get_string(ItemKey::TrackTitle)
+        .is_none_or(|t| t.trim() != search.title.trim())
+    {
+        anyhow::bail!("verification failed: TITLE missing from tag after save");
+    }
+    let has_artist = search
+        .artist
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|a| !a.is_empty());
+    if has_artist && tag.get_string(ItemKey::TrackArtist).is_none_or(str::is_empty) {
+        anyhow::bail!("verification failed: ARTIST missing from tag after save");
     }
     Ok(())
 }

@@ -1,7 +1,9 @@
 //! rmus-dl：在线音乐源插件（酷我 / 酷狗）。混合插件 = 方法通道 + UI 画布。
 //!
 //! 方法协议与进程外版一致（search/download/cancel，形状见
-//! docs/plugins.md）；`rmus dl` CLI 走方法通道。
+//! docs/plugins.md）；命令行入口经 manifest 的 `cli: "dl"` 注册：
+//! `rmus -dl <参数...>` → 客户端调 `cli` 方法（kind=task，参数
+//! `{"args":[...]}`）——搜索列候选 / 按编号下载 / 批量下载。
 //!
 //! UI 画布（TUI「在线」tab 的替代品）：`PluginData submit` 注入搜索词 →
 //! 后台 worker 跑 search → 结果列表渲染；CHAR 'd' 对选中项发起后台
@@ -11,6 +13,7 @@
 mod download;
 mod sources;
 
+use anyhow::Context as _;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -27,8 +30,8 @@ const FLAC_ONLY: bool = true;
 const SEARCH_TASK: u64 = 1;
 
 declare_plugin_manifest! {
-    name: "rmus-dl", version: "0.3.1", ui: true, tab: "在线",
-    methods: [("search", "call"), ("download", "task"), ("cancel", "call")],
+    name: "rmus-dl", version: "0.3.2", ui: true, tab: "在线", cli: "dl",
+    methods: [("search", "call"), ("download", "task"), ("cancel", "call"), ("cli", "task")],
     handle: handle,
 }
 
@@ -68,8 +71,131 @@ fn handle(method: &str, params: &serde_json::Value) -> Result<serde_json::Value,
         "search" => search(params).map_err(|e| format!("{e:#}")),
         "download" => download(params).map_err(|e| format!("{e:#}")),
         "cancel" => Ok(serde_json::json!({"cancelled": true})),
+        "cli" => cli(params).map_err(|e| format!("{e:#}")),
         other => Err(format!("未知方法 “{other}”")),
     }
+}
+
+const CLI_USAGE: &str = "rmus -dl —— 在线音乐下载（酷我/酷狗，只要无损）
+用法：
+  rmus -dl <关键词...>           下载第一个搜索结果
+  rmus -dl --list <关键词...>    搜索并列出候选（编号供 --pick）
+  rmus -dl --pick N <关键词...>  下载列表中第 N 个（从 1 起）
+  rmus -dl --top N <关键词...>   下载前 N 个
+选项：
+  -l, --list   只搜索不下载
+  --pick N     按编号下载单个
+  --top N      批量下载前 N 个
+  --json       原样打印结果 JSON（客户端旗标）
+  -h, --help   本用法";
+
+/// 命令行入口：客户端把 `rmus -dl` 后面的参数打包 `{"args":[...]}` 进来。
+/// 结果约定形状：`usage` / `songs` / `downloaded`+`failed`，客户端据此
+/// 渲染（--json 时原样透传）。kind=task：进度经 notify 推给客户端。
+fn cli(params: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let args: Vec<String> = params
+        .get("args")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut flag = "";
+    let mut n: usize = 1;
+    let mut words: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => flag = "help",
+            "--list" | "-l" => flag = "list",
+            "--pick" | "--top" => {
+                flag = if args[i] == "--pick" { "pick" } else { "top" };
+                let value = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .filter(|v| *v > 0)
+                    .context(format!("{} 需要正整数编号", args[i]))?;
+                n = value;
+                i += 1;
+            }
+            other if other.starts_with('-') => {
+                anyhow::bail!("未知选项 {other}（--help 看用法）");
+            }
+            word => words.push(word.to_string()),
+        }
+        i += 1;
+    }
+    let query = words.join(" ").trim().to_string();
+
+    if flag == "help" || (flag.is_empty() && query.is_empty()) {
+        return Ok(serde_json::json!({ "usage": CLI_USAGE }));
+    }
+    if query.is_empty() {
+        anyhow::bail!("缺少关键词（例：rmus -dl --list 郁可唯）");
+    }
+
+    let songs = run_search(&query)?;
+    match flag {
+        "list" => Ok(serde_json::json!({ "query": query, "songs": songs })),
+        "pick" => {
+            let song = songs.get(n - 1).context(format!(
+                "编号超出范围：共 {} 条（rmus -dl --list {query} 查看）",
+                songs.len()
+            ))?;
+            download_songs(std::slice::from_ref(song))
+        }
+        "top" => {
+            let end = n.min(songs.len());
+            download_songs(&songs[..end])
+        }
+        "" => download_songs(&songs[..1]),
+        _ => unreachable!("flag 已穷举"),
+    }
+}
+
+fn run_search(query: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+    let value = search(&serde_json::json!({ "query": query }))?;
+    Ok(value
+        .get("songs")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// 逐首下载，失败不挡后续；结果统一 `downloaded`/`failed` 两个数组。
+/// 有失败时客户端以非零码退出，但已下载的照常落盘。
+fn download_songs(songs: &[serde_json::Value]) -> anyhow::Result<serde_json::Value> {
+    let mut downloaded = Vec::new();
+    let mut failed = Vec::new();
+    for song in songs {
+        let title = song
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let artist = song
+            .get("artist")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        notify(&serde_json::json!({ "phase": "download", "title": title, "artist": artist }));
+        match download(&serde_json::json!({ "song": song })) {
+            Ok(result) => downloaded.push(serde_json::json!({
+                "title": title,
+                "artist": artist,
+                "path": result.get("path"),
+            })),
+            Err(e) => failed.push(serde_json::json!({
+                "title": title,
+                "artist": artist,
+                "error": format!("{e:#}"),
+            })),
+        }
+    }
+    Ok(serde_json::json!({ "downloaded": downloaded, "failed": failed }))
 }
 
 /// 串行查酷我 + 酷狗；单源失败不挡另一源（错误拼进结果说明）。
@@ -194,13 +320,13 @@ fn finish_download<S: MusicSource>(
             notify(&serde_json::json!({"received": received, "total": total}));
         },
     };
-    let file_path = download::download_file(&url, &fallback_name, &mut opts)?;
+    let file_path = download::download_file(&url, &fallback_name, search_result, &mut opts)?;
 
     // 元数据是门禁：拿不到或写不进去，这次下载就算失败，清理产物
     notify(&serde_json::json!({"phase": "metadata"}));
     let meta_result = source
         .get_metadata(search_result)
-        .and_then(|meta| write_metadata(&file_path, &meta, probe.is_flac));
+        .and_then(|meta| write_metadata(&file_path, &meta, search_result, probe.is_flac));
     if let Err(e) = meta_result {
         let path_str = file_path.display().to_string();
         if !fs::remove(&path_str) {

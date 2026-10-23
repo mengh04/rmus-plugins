@@ -2,6 +2,10 @@
 members = ["crates/*"]
 resolver = "3"
 
+# 本地开发：cli 入口等新 ABI 特性先在本地 rmus 仓库里，待宿主推送后移除
+[patch."https://github.com/mengh04/rmus"]
+rmus-plugin-sdk = { path = "../rmus/crates/plugin-sdk" }
+
 # wasm 产物体积优先（插件被 rmusd 从磁盘加载，解释执行，代码量影响内存）
 [profile.release]
 opt-level = "s"

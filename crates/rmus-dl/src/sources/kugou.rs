@@ -305,7 +305,8 @@ fn downgrade_to_http(url: &str) -> String {
     url.replacen("https://", "http://", 1)
 }
 
-/// 极简 URL join：相对路径拼到 base 的根（meting 返回的都是绝对路径）。
+/// 极简 URL join：相对路径拼到 base 的根。meting 站点时而返回绝对路径、
+/// 时而返回不带前导斜杠的相对路径（如 "api.php?get=url..."），两种都要接对。
 fn join_url(base: &str, relative: &str) -> String {
     if relative.starts_with("http://") || relative.starts_with("https://") {
         return relative.to_string();
@@ -315,5 +316,9 @@ fn join_url(base: &str, relative: &str) -> String {
         .take(3)
         .collect::<Vec<_>>()
         .join("/");
-    format!("{root}{relative}")
+    if relative.starts_with('/') {
+        format!("{root}{relative}")
+    } else {
+        format!("{root}/{relative}")
+    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "rmus-dl"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 description = "rmus wasm 下载插件：酷我/酷狗搜索 + 下载"
 license = "MIT"
